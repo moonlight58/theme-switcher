@@ -7,6 +7,10 @@
   "muted": "5F5F5F",
   "idle": "3a3a3a",
   "starship": "8f8b8b",
+  "qmlsurface": "222222",
+  "qmlborder": "2a2a2a",
+  "qmlgradienttop": "e8ebed",
+  "qmlgradientbottom": "d2d6d9",
 
   "color0": "4d4d4d",
   "color8": "5a5a5a",
