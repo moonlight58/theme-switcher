@@ -26,7 +26,7 @@ show_always = true
 
 [hostname]
 ssh_only = false
-format = '[@](#{{starship}})[$hostname](bold #{{foreground}}) '
+format = '[@](#{{muted}})[$hostname](bold #{{foreground}}) '
 disabled = false
 
 [character]
@@ -44,7 +44,7 @@ truncate_to_repo  = false
 home_symbol       = "~"
 
 [git_branch]
-format = " [\\(](#{{starship}})[$branch](#{{accent}})[\\)](#{{starship}})"
+format = " [\\(](#{{muted}})[$branch](#{{accent}})[\\)](#{{muted}})"
 style  = "#{{accent}}"
 
 [git_status]
@@ -61,19 +61,19 @@ deleted    = "-"
 
 [nodejs]
 disabled = false
-format   = " [node $version](#{{starship}})"
+format   = " [node $version](#{{muted}})"
 
 [python]
 disabled = false
-format   = " [py $version](#{{starship}})"
+format   = " [py $version](#{{muted}})"
 
 [rust]
 disabled = false
-format   = " [rs $version](#{{starship}})"
+format   = " [rs $version](#{{muted}})"
 
 [cmd_duration]
 min_time = 2000
-format   = " [${duration}](#{{starship}})"
+format   = " [${duration}](#{{muted}})"
 
 [status]
 disabled = false
@@ -81,11 +81,11 @@ format   = " [x $status](bold #{{accent}})"
 
 [jobs]
 disabled = false
-format   = " [job:$number](#{{starship}})"
+format   = " [job:$number](#{{muted}})"
 
 [time]
 disabled    = true
-format      = " [$time](#{{starship}})"
+format      = " [$time](#{{muted}})"
 time_format = "%H:%M"
 
 [package]
