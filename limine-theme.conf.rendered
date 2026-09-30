@@ -1,0 +1,19 @@
+# BEGIN theme-switcher
+term_palette: 1b1c1d;4166f5;7A8A78;8C8570;727C8C;8C7A86;748C88;fdfdfd
+term_palette_bright: 3b3c3c;4166f5;9AAC96;B0A88C;96A0B0;A692A0;9CB0AC;fdfdfd
+
+term_background: FF1b1c1d
+term_foreground: fdfdfd
+term_background_bright: FF3b3c3c
+term_foreground_bright: fdfdfd
+
+interface_branding_color: 4166f5
+interface_help_color: 4166f5
+interface_help_color_bright: 4166f5
+
+term_font: boot():/limine_font.F09
+term_font_scale: 1x1
+
+wallpaper: boot():/wallpaper.png
+wallpaper_style: centered
+# END theme-switcher

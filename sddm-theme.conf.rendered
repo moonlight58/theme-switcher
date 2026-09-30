@@ -10,7 +10,7 @@ color=#000000
 font=NType82
 
 # Palette - change a value here, it propagates everywhere below
-Accent=#7f00ff
+Accent=#4166f5
 Dark=#1b1c1d
 Light=#fdfdfd
 Surface=#222324

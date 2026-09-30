@@ -7,9 +7,12 @@ apply_theme.py - render per-app color files from palette.json and reload apps.
     ./apply_theme.py --reset            forget the saved accent, go back to palette.json
     ./apply_theme.py --dry-run          render in memory, report what would change, write nothing
     ./apply_theme.py --diff             like --dry-run, plus a unified diff of every file that would change
-    ./apply_theme.py --sddm             also stage the SDDM theme.conf (never installed automatically)
+    ./apply_theme.py --sddm             also render + install the SDDM theme.conf.user (uses sudo)
+    ./apply_theme.py --limine           also update the Limine theme block + boot wallpaper (uses sudo)
     ./apply_theme.py --force            treat everything as changed (wallpaper + reloads)
     ./apply_theme.py --no-reload --no-wallpaper
+
+    Typical:  ./apply_theme.py --accent 4166F5 --sddm --limine
 
 Template syntax:  {{name}}   {{name|filter}}   {{name|filter:arg}}
 
@@ -26,6 +29,14 @@ To write a literal double-brace pair in a template, put a backslash in front of 
 Palette: background / foreground / accent are the inputs. muted, idle, surface,
 border, border_inactive and shadow are derived from them unless palette.json
 defines a key with the same name (that pins it). Keys starting with "_" are ignored.
+
+Environment overrides:
+    GEN_WALLPAPER          path to gen_wallpaper.py
+    STARSHIP_CONFIG        starship output path
+    SDDM_THEME_DIR         SDDM theme directory (default /usr/share/sddm/themes/nothing)
+    LIMINE_CONF            limine.conf location (default /boot/EFI/BOOT/limine.conf)
+    LIMINE_WALLPAPER       boot wallpaper location (default /boot/wallpaper.png)
+    LIMINE_WALLPAPER_SIZE  WxH of the boot wallpaper (default 1920x1080)
 """
 import argparse
 import difflib
@@ -46,7 +57,7 @@ TEMPLATE_DIR = SCRIPT_DIR / "templates"
 MONITOR = "eDP-1"
 WALLPAPER_OUT = HOME / ".wallpapers/Nothing1.png"
 WALLPAPER_SCRIPT = Path(
-    os.environ.get("GEN_WALLPAPER", HOME / "gen-wallpaper/gen_wallpaper.py")
+    os.environ.get("GEN_WALLPAPER", HOME / "github/gen-wallpaper/gen_wallpaper.py")
 )
 
 # name -> (template filename, output path)
@@ -69,11 +80,34 @@ TARGETS = {
     ),
 }
 
-# Needs root to install, so it is only ever staged next to this script.
-STAGED = {"sddm": ("sddm-theme.conf.tmpl", SCRIPT_DIR / "sddm-theme.conf.rendered")}
+# Need root to install, so they are only ever staged next to this script and
+# then copied with sudo by install_sddm() / install_limine().
+# The key doubles as the CLI flag name (--sddm, --limine).
+STAGED = {
+    "sddm": ("sddm-theme.conf.tmpl", SCRIPT_DIR / "sddm-theme.conf.rendered"),
+    "limine": ("limine-theme.conf.tmpl", SCRIPT_DIR / "limine-theme.conf.rendered"),
+}
+
+# --- SDDM -------------------------------------------------------------------
+
 SDDM_THEME_CONF = Path(
     os.environ.get("SDDM_THEME_DIR", "/usr/share/sddm/themes/nothing")
 ) / "theme.conf.user"
+
+# --- Limine -----------------------------------------------------------------
+
+LIMINE_CONF = Path(os.environ.get("LIMINE_CONF", "/boot/EFI/BOOT/limine.conf"))
+# boot():/wallpaper.png in limine.conf resolves to this file on your ESP.
+LIMINE_WALLPAPER = Path(os.environ.get("LIMINE_WALLPAPER", "/boot/wallpaper.png"))
+# Generated locally first, then copied to the ESP. Add to .gitignore.
+LIMINE_WALLPAPER_SRC = SCRIPT_DIR / "limine-wallpaper.png"
+# Set this to your panel's resolution (or the resolution Limine boots in).
+LIMINE_WALLPAPER_SIZE = os.environ.get("LIMINE_WALLPAPER_SIZE", "1920x1080")
+# Only the text between these markers is ever rewritten; boot entries are untouched.
+LIMINE_BLOCK_RE = re.compile(
+    r"^# BEGIN theme-switcher\n.*?^# END theme-switcher\n?", re.M | re.S
+)
+
 
 class ThemeError(Exception):
     pass
@@ -291,6 +325,29 @@ def reload_hyprpaper(path):
     run(["hyprctl", "hyprpaper", "wallpaper", f"{MONITOR},{path},cover"], "hyprpaper")
 
 
+# --- root-only installs (SDDM, Limine) --------------------------------------
+
+def sudo_run(cmd):
+    """Run `sudo <cmd>` attached to the terminal so the password prompt works.
+    No capture_output and no timeout on purpose."""
+    try:
+        return subprocess.run(["sudo", *cmd]).returncode == 0
+    except FileNotFoundError:
+        print("  [warn] sudo not found")
+        return False
+
+
+def read_maybe_root(path):
+    """Read a file as the user, falling back to `sudo cat` (the ESP may be root-only)."""
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        r = subprocess.run(["sudo", "cat", str(path)], stdout=subprocess.PIPE, text=True)
+        return r.stdout if r.returncode == 0 else None
+
+
 def install_sddm():
     src = STAGED["sddm"][1]
     dest = SDDM_THEME_CONF
@@ -301,16 +358,76 @@ def install_sddm():
         print("  [same]  sddm (already installed)")
         return
     print(f"\nSDDM: installing to {dest} (sudo may ask for your password)")
+    if sudo_run(["install", "-m", "644", str(src), str(dest)]):
+        print("  [ok]   sddm (takes effect the next time the greeter starts)")
+    else:
+        print("  [warn] sddm: install failed")
+
+
+def install_limine():
+    """Replace only the '# BEGIN/END theme-switcher' block inside limine.conf."""
+    block = STAGED["limine"][1].read_text().rstrip("\n") + "\n"
+    current = read_maybe_root(LIMINE_CONF)
+    if current is None:
+        print(f"  [warn] limine: cannot read {LIMINE_CONF} (set LIMINE_CONF)")
+        return
+    if not LIMINE_BLOCK_RE.search(current):
+        print(
+            f"  [warn] limine: no '# BEGIN/END theme-switcher' markers in "
+            f"{LIMINE_CONF}; nothing changed"
+        )
+        return
+    new = LIMINE_BLOCK_RE.sub(lambda m: block, current, count=1)
+    if new == current:
+        print("  [same]  limine (already installed)")
+        return
+    print(f"\nLimine: updating {LIMINE_CONF} (sudo may ask for your password)")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d) / "limine.conf"
+        tmp.write_text(new)
+        if not sudo_run(["cp", "-f", str(LIMINE_CONF), f"{LIMINE_CONF}.bak"]):
+            print("  [warn] limine: backup failed, aborting")
+            return
+        # cp (not install -m): chmod can fail on FAT filesystems like an ESP.
+        if sudo_run(["cp", str(tmp), str(LIMINE_CONF)]):
+            print(f"  [ok]   limine (backup: {LIMINE_CONF}.bak)")
+        else:
+            print("  [warn] limine: copy failed")
+
+
+def update_limine_wallpaper(pal):
+    """Generate a fresh wallpaper with the current palette and copy it to the ESP."""
+    if not WALLPAPER_SCRIPT.exists():
+        print(f"  [skip] limine wallpaper: {WALLPAPER_SCRIPT} not found (set GEN_WALLPAPER)")
+        return
+    cmd = [
+        sys.executable, str(WALLPAPER_SCRIPT),
+        "--accent", pal["accent"],
+        "--bg", pal["background"],
+        "--base", pal["foreground"],
+        "--size", LIMINE_WALLPAPER_SIZE,
+        "-o", str(LIMINE_WALLPAPER_SRC),
+    ]
     try:
-        # No capture_output / timeout: sudo needs the terminal to prompt.
-        r = subprocess.run(["sudo", "install", "-m", "644", str(src), str(dest)])
-    except FileNotFoundError:
-        print("  [warn] sddm: sudo not found")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("  [warn] limine wallpaper: generation timed out")
         return
     if r.returncode:
-        print(f"  [warn] sddm: install failed (exit {r.returncode})")
+        print(f"  [warn] limine wallpaper: {r.stderr.strip() or r.returncode}")
+        return
+
+    # The generator is deterministic, so identical bytes means nothing to do.
+    # cmp runs under sudo because the ESP may be root-only; exit 0 = identical.
+    if subprocess.run(
+        ["sudo", "cmp", "-s", str(LIMINE_WALLPAPER_SRC), str(LIMINE_WALLPAPER)]
+    ).returncode == 0:
+        print("  [same]  limine wallpaper (already installed)")
+        return
+    if sudo_run(["cp", str(LIMINE_WALLPAPER_SRC), str(LIMINE_WALLPAPER)]):
+        print(f"  [ok]   limine wallpaper -> {LIMINE_WALLPAPER}")
     else:
-        print("  [ok]   sddm (takes effect the next time the greeter starts)")
+        print("  [warn] limine wallpaper: copy failed")
 
 
 # --- main -------------------------------------------------------------------
@@ -326,7 +443,8 @@ def main():
     ap.add_argument("--force", action="store_true", help="regen wallpaper + reload even if unchanged")
     ap.add_argument("--no-reload", action="store_true")
     ap.add_argument("--no-wallpaper", action="store_true")
-    ap.add_argument("--sddm", action="store_true", help="also stage the SDDM theme.conf")
+    ap.add_argument("--sddm", action="store_true", help="also render + install the SDDM theme (sudo)")
+    ap.add_argument("--limine", action="store_true", help="also update the Limine theme + boot wallpaper (sudo)")
     args = ap.parse_args()
 
     args.dry_run = args.dry_run or args.diff
@@ -345,8 +463,7 @@ def main():
         sys.exit(f"palette error: {e}")
 
     targets = dict(TARGETS)
-    if args.sddm:
-        targets.update(STAGED)
+    targets.update({k: v for k, v in STAGED.items() if getattr(args, k)})
 
     outputs, errors = build(pal, targets)
     if errors:
@@ -385,8 +502,15 @@ def main():
         STATE_FILE.write_text(json.dumps({"accent": accent}, indent=2) + "\n")
     if args.reset:
         STATE_FILE.unlink(missing_ok=True)
+
+    # Root-only installs. These sit before the "nothing changed" early return
+    # on purpose: they must run whenever their flag is passed.
     if args.sddm:
         install_sddm()
+    if args.limine:
+        install_limine()
+        if not args.no_wallpaper:
+            update_limine_wallpaper(pal)
 
     if not (live_changed or args.force):
         print("\nNothing changed; skipping wallpaper and reloads.")
