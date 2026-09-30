@@ -1,198 +1,395 @@
 #!/usr/bin/env python3
 """
-apply_theme.py — regenerate per-app color files from one palette.json
-and trigger whatever reload mechanism each app actually needs.
+apply_theme.py - render per-app color files from palette.json and reload apps.
 
-Layout expected next to this file:
-    palette.json
-    templates/*.tmpl
+    ./apply_theme.py                    render + reload (reuses the saved accent, if any)
+    ./apply_theme.py --accent 0fff50    set + save the accent, then render, regen wallpaper, reload
+    ./apply_theme.py --reset            forget the saved accent, go back to palette.json
+    ./apply_theme.py --dry-run          render in memory, report what would change, write nothing
+    ./apply_theme.py --diff             like --dry-run, plus a unified diff of every file that would change
+    ./apply_theme.py --sddm             also stage the SDDM theme.conf (never installed automatically)
+    ./apply_theme.py --force            treat everything as changed (wallpaper + reloads)
+    ./apply_theme.py --no-reload --no-wallpaper
 
-Usage:
-    ./apply_theme.py                # render + reload everything
-    ./apply_theme.py --no-reload    # only write the files
-    ./apply_theme.py --sddm         # also print the SDDM restart step
+Template syntax:  {{name}}   {{name|filter}}   {{name|filter:arg}}
+
+    hex (default)  e2201f
+    hash           #e2201f
+    hasha:88       #e2201f88            RRGGBBAA, for rofi / CSS
+    rgb            rgb(e2201f)          hyprland / hyprlock
+    rgba:aa        rgba(e2201faa)       hyprland / hyprlock, alpha is 2 hex digits, default ff
+    css:0.35       rgba(226, 32, 31, 0.35)
+    ansi           226;32;31            for escape sequences like ESC[38;2;...m
+
+To write a literal double-brace pair in a template, put a backslash in front of it.
+
+Palette: background / foreground / accent are the inputs. muted, idle, surface,
+border, border_inactive and shadow are derived from them unless palette.json
+defines a key with the same name (that pins it). Keys starting with "_" are ignored.
 """
-
 import argparse
+import difflib
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 PALETTE_FILE = SCRIPT_DIR / "palette.json"
+STATE_FILE = SCRIPT_DIR / "state.json"  # saved --accent override; add to .gitignore
 TEMPLATE_DIR = SCRIPT_DIR / "templates"
 
-TOKEN_RE = re.compile(r"\{\{(\w+)\}\}")
+MONITOR = "eDP-1"
+WALLPAPER_OUT = HOME / ".wallpapers/Nothing1.png"
+WALLPAPER_SCRIPT = Path(
+    os.environ.get("GEN_WALLPAPER", HOME / "gen-wallpaper/gen_wallpaper.py")
+)
 
-# name -> (template filename, real output path)
-# Adjust the output paths to match your actual dotfiles.
+# name -> (template filename, output path)
 TARGETS = {
-    "waybar": (
-        "waybar-colors.css.tmpl",
-        Path.home() / ".config/waybar/colors.css",
-    ),
-    "eww": (
-        "eww-colors.scss.tmpl",
-        Path.home() / ".config/eww/colors.scss",
-    ),
-    "hyprland": (
-        "hypr-colors.lua.tmpl",
-        Path.home() / ".config/hypr/colors.lua",
-    ),
-    "hyprlock": (
-        "hyprlock-colors.conf.tmpl",
-        Path.home() / ".config/hypr/hyprlock-colors.conf",
-    ),
-    "kitty": (
-        "kitty-colors.conf.tmpl",
-        Path.home() / ".config/kitty/colors.conf",
-    ),
+    "waybar": ("waybar-colors.css.tmpl", HOME / ".config/waybar/colors.css"),
+    "eww": ("eww-colors.scss.tmpl", HOME / ".config/eww/colors.scss"),
+    "hyprland": ("hypr-colors.lua.tmpl", HOME / ".config/hypr/colors.lua"),
+    "hyprlock": ("hyprlock-colors.conf.tmpl", HOME / ".config/hypr/hyprlock-colors.conf"),
+    "kitty": ("kitty-colors.conf.tmpl", HOME / ".config/kitty/colors.conf"),
+    # Whole-file templates: the rendered file IS the app's config, so hand-edit
+    # the template, never the output. Neither app has a reload step (rofi and
+    # fastfetch read their config fresh on every launch).
+    "rofi": ("rofi-nothing.rasi.tmpl", HOME / ".config/rofi/nothing.rasi"),
+    "fastfetch": ("fastfetch.jsonc.tmpl", HOME / ".config/fastfetch/config.jsonc"),
+    # Starship reads $STARSHIP_CONFIG, else ~/.config/starship.toml. Not the
+    # ~/.config/starship/ directory your README symlinks.
     "starship": (
         "starship.toml.tmpl",
-        Path.home() / ".config/starship.toml",
+        Path(os.environ.get("STARSHIP_CONFIG", HOME / ".config/starship.toml")),
     ),
 }
 
-# Rendered separately: needs root to install, so we only write it to a
-# staging path and print the command instead of touching /usr/share.
-SDDM_TEMPLATE = "sddm-theme.conf.tmpl"
-SDDM_STAGING = SCRIPT_DIR / "sddm-theme.conf.rendered"
+# Needs root to install, so it is only ever staged next to this script.
+STAGED = {"sddm": ("sddm-theme.conf.tmpl", SCRIPT_DIR / "sddm-theme.conf.rendered")}
 
 
-def load_palette() -> dict:
-    with open(PALETTE_FILE) as f:
-        return json.load(f)
+class ThemeError(Exception):
+    pass
 
 
-def render(text: str, palette: dict, is_hyprland: bool = False) -> str:
-    def repl(match: re.Match) -> str:
-        key = match.group(1)
-        if key not in palette:
-            raise KeyError(f"palette.json is missing key: {key}")
-        
-        val = palette[key]
-        # Si la cible est Hyprland, on formate automatiquement en rgba(...)
-        if is_hyprland:
-            return hex_to_rgba(val)
-        
-        return val
+# --- color helpers ----------------------------------------------------------
 
-    return TOKEN_RE.sub(repl, text)
+def norm(value):
+    h = str(value).strip().lstrip("#").lower()
+    if not re.fullmatch(r"[0-9a-f]{6}", h):
+        raise ThemeError(f"not a 6-digit hex color: {value!r}")
+    return h
 
 
-def render_all(palette: dict) -> None:
-    for name, (template_name, out_path) in TARGETS.items():
-        tmpl_path = TEMPLATE_DIR / template_name
-        if not tmpl_path.exists():
-            print(f"  [skip] {name}: no template at {tmpl_path}")
+def to_rgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def mix(a, b, t):
+    """Move color a the fraction t of the way toward b (t=0 -> a, t=1 -> b)."""
+    return "".join(
+        f"{round(x + (y - x) * t):02x}" for x, y in zip(to_rgb(a), to_rgb(b))
+    )
+
+
+def _toward_fg(t):
+    return lambda p: mix(p["background"], p["foreground"], t)
+
+
+# Tuned so the defaults land near the values you had hardcoded.
+DERIVED = {
+    "muted": _toward_fg(0.55),            # your README's "foreground at 0.55"
+    "idle": _toward_fg(0.14),
+    "surface": _toward_fg(0.03),
+    "border": _toward_fg(0.07),
+    "border_inactive": _toward_fg(0.27),
+    "shadow": lambda p: mix(p["background"], "000000", 0.05),
+}
+
+
+def load_palette(cli_accent, use_state=True):
+    raw = json.loads(PALETTE_FILE.read_text())
+    if use_state and STATE_FILE.exists():
+        raw.update(json.loads(STATE_FILE.read_text()))
+    if cli_accent:
+        raw["accent"] = cli_accent
+
+    pal = {}
+    for key, value in raw.items():
+        if key.startswith("_"):
             continue
-        
-        # On passe True si le template est destiné à Hyprland
-        is_hyprland = "hyprland" in name
-        rendered = render(tmpl_path.read_text(), palette, is_hyprland=is_hyprland)
+        try:
+            pal[key] = norm(value)
+        except ThemeError as e:
+            raise ThemeError(f"palette key {key!r}: {e}")
 
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(rendered)
-        print(f"  [ok]   {name} -> {out_path}")
-
-
-def render_sddm(palette: dict) -> None:
-    tmpl_path = TEMPLATE_DIR / SDDM_TEMPLATE
-    if not tmpl_path.exists():
-        return
-    rendered = render(tmpl_path.read_text(), palette)
-    SDDM_STAGING.write_text(rendered)
-    print(f"  [ok]   sddm -> staged at {SDDM_STAGING} (not installed)")
+    for key in ("background", "foreground", "accent"):
+        if key not in pal:
+            raise ThemeError(f"palette is missing required key {key!r}")
+    for name, fn in DERIVED.items():
+        pal.setdefault(name, fn(pal))  # an explicit palette.json value wins
+    return pal
 
 
-def hex_to_rgba(hex_color: str, alpha: str = "ff") -> str:
-    # Nettoie le '#' au cas où il y en a un, puis génère rgba(HEXalpha)
-    clean_hex = str(hex_color).lstrip('#')
-    return f"rgba({clean_hex}{alpha})"
+# --- templating -------------------------------------------------------------
 
-# --- reload mechanisms -----------------------------------------------------
-# Waybar and eww watch their own config files, so nothing has to be sent to
-# them — they're listed here only as a place to add a forced-restart
-# fallback later if you ever need one (see the comments below).
-
-def reload_waybar() -> None:
-    pass  # requires "reload_style_on_change": true in config.jsonc
-    # Fallback if that ever misbehaves (e.g. custom -s path + @import):
-    # subprocess.run(["pkill", "-x", "waybar"], check=False)
-    # subprocess.Popen(["waybar"], start_new_session=True)
+def _alpha(arg):
+    a = (arg or "ff").lower()
+    if not re.fullmatch(r"[0-9a-f]{2}", a):
+        raise ThemeError(f"alpha must be 2 hex digits, got {arg!r}")
+    return a
 
 
-def reload_eww() -> None:
-    subprocess.run(["eww", "reload"], check=False)
-
-
-def reload_hyprland() -> None:
-    # Hyprland reloads sourced files on save already; this just makes
-    # sure it happens immediately rather than on Hyprland's own timing.
-    subprocess.run(["hyprctl", "reload"], check=False)
-
-
-def reload_kitty() -> None:
-    _, colors_path = TARGETS["kitty"]
+def _css_alpha(arg):
     try:
-        subprocess.run(
-            ["kitty", "@", "set-colors", "--all", "-a", str(colors_path)],
-            check=True,
-            timeout=2,
-            capture_output=True,
-        )
-        print("  [ok]   kitty: pushed live via remote control")
+        return f"{float(arg if arg is not None else 1):g}"
+    except ValueError:
+        raise ThemeError(f"css alpha must be a number, got {arg!r}")
+
+
+FILTERS = {
+    "hex": lambda h, a: h,
+    "hash": lambda h, a: f"#{h}",
+    "hasha": lambda h, a: f"#{h}{_alpha(a)}",
+    "rgb": lambda h, a: f"rgb({h})",
+    "rgba": lambda h, a: f"rgba({h}{_alpha(a)})",
+    "css": lambda h, a: "rgba({}, {}, {}, {})".format(*to_rgb(h), _css_alpha(a)),
+    "ansi": lambda h, a: ";".join(str(v) for v in to_rgb(h)),
+}
+
+TOKEN_RE = re.compile(
+    r"(?<!\\)\{\{\s*(\w+)\s*(?:\|\s*(\w+)\s*(?::\s*([\w.]+)\s*)?)?\}\}"
+)
+
+
+def render(text, pal, source):
+    def repl(m):
+        key, filt, arg = m.group(1), m.group(2) or "hex", m.group(3)
+        if key not in pal:
+            raise ThemeError(f"{source}: unknown token {key!r}")
+        if filt not in FILTERS:
+            raise ThemeError(f"{source}: unknown filter {filt!r} on {key!r}")
+        try:
+            return FILTERS[filt](pal[key], arg)
+        except ThemeError as e:
+            raise ThemeError(f"{source}: {key}|{filt}: {e}")
+
+    return TOKEN_RE.sub(repl, text).replace("\\{{", "{{")
+
+
+def build(pal, targets):
+    """Phase 1: render everything in memory. Collect every error, write nothing."""
+    outputs, errors = {}, []
+    for name, (tmpl, out) in targets.items():
+        path = TEMPLATE_DIR / tmpl
+        if not path.exists():
+            errors.append(f"{name}: missing template {path}")
+            continue
+        try:
+            outputs[name] = (out, render(path.read_text(), pal, tmpl))
+        except ThemeError as e:
+            errors.append(str(e))
+    return outputs, errors
+
+
+def write_atomic(path, content):
+    real = path.resolve()  # follow symlinks: replace the repo file, not the link
+    real.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=real.parent, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, real)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+# --- wallpaper + reloads ----------------------------------------------------
+
+def run(cmd, label):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
-        print("  [skip] kitty: binary not found")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        print(
-            "  [warn] kitty: remote control unavailable "
-            "(check 'allow_remote_control' in kitty.conf) — "
-            "new windows will still pick up the theme"
-        )
+        print(f"  [skip] {label}: {cmd[0]} not found")
+        return
+    except subprocess.TimeoutExpired:
+        print(f"  [warn] {label}: timed out")
+        return
+    if cmd[0] == "pkill" and r.returncode == 1:
+        print(f"  [skip] {label}: not running")
+    elif r.returncode:
+        detail = r.stderr.strip() or r.stdout.strip() or f"exit {r.returncode}"
+        print(f"  [warn] {label}: {detail}")
+    else:
+        print(f"  [ok]   {label}")
 
 
-def print_sddm_instructions() -> None:
+def regen_wallpaper(pal):
+    """Returns the versioned image path (what hyprpaper must be given), or None."""
+    if not WALLPAPER_SCRIPT.exists():
+        print(f"  [skip] wallpaper: {WALLPAPER_SCRIPT} not found (set GEN_WALLPAPER)")
+        return None
+    WALLPAPER_OUT.parent.mkdir(parents=True, exist_ok=True)
+    # --versioned: writes Nothing1-<hash>.png, repoints the stable Nothing1.png
+    # symlink (rofi + hyprpaper.conf keep using that name) and prunes old versions.
+    cmd = [
+        sys.executable, str(WALLPAPER_SCRIPT),
+        "--accent", pal["accent"],
+        "--bg", pal["background"],
+        "--base", pal["foreground"],
+        "-o", str(WALLPAPER_OUT),
+        "--versioned",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("  [warn] wallpaper: timed out")
+        return None
+    lines = r.stdout.strip().splitlines()
+    if r.returncode or not lines:
+        print(f"  [warn] wallpaper: {r.stderr.strip() or r.returncode}")
+        return None
+    path = Path(lines[-1])
+    print(f"  [ok]   wallpaper -> {path}")
+    return path
+
+
+def reload_eww():
+    run(["eww", "reload"], "eww")
+
+
+def reload_hyprland():
+    # UNVERIFIED: whether this re-reads a require()d colors.lua or serves a
+    # cached module. Test by changing the accent and checking the active border.
+    run(["hyprctl", "reload"], "hyprland")
+
+
+def reload_kitty():
+    colors = str(TARGETS["kitty"][1])
+    # Outside a kitty window this needs `allow_remote_control socket-only` and
+    # `listen_on unix:/tmp/kitty` in kitty.conf; kitty appends its pid to the path.
+    socks = [] if os.environ.get("KITTY_LISTEN_ON") else sorted(Path("/tmp").glob("kitty-*"))
+    cmds = [
+        ["kitty", "@", "--to", f"unix:{s}", "set-colors", "--all", colors] for s in socks
+    ] or [["kitty", "@", "set-colors", "--all", colors]]
+    for c in cmds:
+        run(c, "kitty")
+
+
+def reload_hyprpaper(path):
+    # hyprpaper ignores a changed file at an unchanged path, so hand it the
+    # versioned path, not the stable Nothing1.png symlink.
+    run(["hyprctl", "hyprpaper", "wallpaper", f"{MONITOR},{path},cover"], "hyprpaper")
+
+
+def print_sddm_instructions():
     print(
-        "\nSDDM: copy the staged file into your theme, then restart the "
-        "greeter manually (needs root, and is worth testing once before "
-        "you fully trust it in a script):\n"
-        f"  sudo cp {SDDM_STAGING} /usr/share/sddm/themes/<your-theme>/theme.conf.user\n"
+        "\nSDDM: copy the staged file into the theme, then restart the greeter "
+        "yourself (root, and test it once before trusting it in a script):\n"
+        f"  sudo cp {STAGED['sddm'][1]} /usr/share/sddm/themes/<theme>/theme.conf.user\n"
         "  sudo systemctl restart sddm"
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--no-reload", action="store_true", help="only write files, skip reload calls"
+# --- main -------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
-        "--sddm", action="store_true", help="also render + print the SDDM step"
-    )
-    args = parser.parse_args()
+    ap.add_argument("--accent", metavar="HEX", help="override + save the accent color")
+    ap.add_argument("--reset", action="store_true", help="drop the saved accent override")
+    ap.add_argument("--dry-run", action="store_true", help="write nothing")
+    ap.add_argument("--diff", action="store_true", help="dry run that also prints a diff per changed file")
+    ap.add_argument("--force", action="store_true", help="regen wallpaper + reload even if unchanged")
+    ap.add_argument("--no-reload", action="store_true")
+    ap.add_argument("--no-wallpaper", action="store_true")
+    ap.add_argument("--sddm", action="store_true", help="also stage the SDDM theme.conf")
+    args = ap.parse_args()
 
-    if not PALETTE_FILE.exists():
-        sys.exit(f"palette.json not found at {PALETTE_FILE}")
+    args.dry_run = args.dry_run or args.diff
+    if args.accent and args.reset:
+        ap.error("--accent and --reset are mutually exclusive")
+    accent = None
+    if args.accent:
+        try:
+            accent = norm(args.accent)
+        except ThemeError as e:
+            ap.error(str(e))
 
-    palette = load_palette()
+    try:
+        pal = load_palette(accent, use_state=not args.reset)
+    except (ThemeError, OSError, json.JSONDecodeError) as e:
+        sys.exit(f"palette error: {e}")
 
-    print("Rendering:")
-    render_all(palette)
+    targets = dict(TARGETS)
     if args.sddm:
-        render_sddm(palette)
+        targets.update(STAGED)
+
+    outputs, errors = build(pal, targets)
+    if errors:
+        print("Nothing written. Fix these first:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"accent #{pal['accent']}" + ("  (dry run)" if args.dry_run else ""))
+    live_changed = False
+    for name, (out, content) in outputs.items():
+        real = out.resolve()
+        old = real.read_text() if real.exists() else ""
+        if real.exists() and old == content:
+            print(f"  [same]  {name}")
+            continue
+        if name in TARGETS:
+            live_changed = True
+        if args.dry_run:
+            print(f"  [would write] {name} -> {out}")
+            if args.diff:
+                sys.stdout.writelines(
+                    "      " + line if line.endswith("\n") else "      " + line + "\n"
+                    for line in difflib.unified_diff(
+                        old.splitlines(), content.splitlines(),
+                        "current", "rendered", lineterm="", n=0)
+                )
+            continue
+        write_atomic(out, content)
+        print(f"  [ok]    {name} -> {out}")
+
+    if args.dry_run:
+        return
+
+    if accent:
+        STATE_FILE.write_text(json.dumps({"accent": accent}, indent=2) + "\n")
+    if args.reset:
+        STATE_FILE.unlink(missing_ok=True)
+    if args.sddm:
+        print_sddm_instructions()
+
+    if not (live_changed or args.force):
+        print("\nNothing changed; skipping wallpaper and reloads.")
+        return
+
+    wallpaper_path = None
+    if not args.no_wallpaper:
+        print("\nWallpaper:")
+        wallpaper_path = regen_wallpaper(pal)
 
     if not args.no_reload:
         print("\nReloading:")
         reload_eww()
         reload_hyprland()
         reload_kitty()
-        reload_waybar()  # no-op by design, see comment above
-
-    if args.sddm:
-        print_sddm_instructions()
+        # waybar needs no call: "reload_style_on_change": true in config.jsonc
+        if wallpaper_path:
+            reload_hyprpaper(wallpaper_path)
 
 
 if __name__ == "__main__":
