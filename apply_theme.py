@@ -523,12 +523,13 @@ def main():
 
     if not args.no_reload:
         print("\nReloading:")
-        reload_eww()
-        reload_hyprland()
-        reload_kitty()
         # waybar needs no call: "reload_style_on_change": true in config.jsonc
         if wallpaper_path:
             reload_hyprpaper(wallpaper_path)
+
+        reload_eww()
+        reload_hyprland()
+        reload_kitty()
 
 
 if __name__ == "__main__":
