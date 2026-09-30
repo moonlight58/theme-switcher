@@ -71,7 +71,9 @@ TARGETS = {
 
 # Needs root to install, so it is only ever staged next to this script.
 STAGED = {"sddm": ("sddm-theme.conf.tmpl", SCRIPT_DIR / "sddm-theme.conf.rendered")}
-
+SDDM_THEME_CONF = Path(
+    os.environ.get("SDDM_THEME_DIR", "/usr/share/sddm/themes/nothing")
+) / "theme.conf.user"
 
 class ThemeError(Exception):
     pass
@@ -289,13 +291,26 @@ def reload_hyprpaper(path):
     run(["hyprctl", "hyprpaper", "wallpaper", f"{MONITOR},{path},cover"], "hyprpaper")
 
 
-def print_sddm_instructions():
-    print(
-        "\nSDDM: copy the staged file into the theme, then restart the greeter "
-        "yourself (root, and test it once before trusting it in a script):\n"
-        f"  sudo cp {STAGED['sddm'][1]} /usr/share/sddm/themes/<theme>/theme.conf.user\n"
-        "  sudo systemctl restart sddm"
-    )
+def install_sddm():
+    src = STAGED["sddm"][1]
+    dest = SDDM_THEME_CONF
+    if not dest.parent.is_dir():
+        print(f"  [warn] sddm: {dest.parent} does not exist (set SDDM_THEME_DIR)")
+        return
+    if dest.exists() and dest.read_text() == src.read_text():
+        print("  [same]  sddm (already installed)")
+        return
+    print(f"\nSDDM: installing to {dest} (sudo may ask for your password)")
+    try:
+        # No capture_output / timeout: sudo needs the terminal to prompt.
+        r = subprocess.run(["sudo", "install", "-m", "644", str(src), str(dest)])
+    except FileNotFoundError:
+        print("  [warn] sddm: sudo not found")
+        return
+    if r.returncode:
+        print(f"  [warn] sddm: install failed (exit {r.returncode})")
+    else:
+        print("  [ok]   sddm (takes effect the next time the greeter starts)")
 
 
 # --- main -------------------------------------------------------------------
@@ -371,7 +386,7 @@ def main():
     if args.reset:
         STATE_FILE.unlink(missing_ok=True)
     if args.sddm:
-        print_sddm_instructions()
+        install_sddm()
 
     if not (live_changed or args.force):
         print("\nNothing changed; skipping wallpaper and reloads.")
